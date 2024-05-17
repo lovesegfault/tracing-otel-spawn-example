@@ -1,0 +1,25 @@
+use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, EnvFilter, Layer, Registry};
+
+#[allow(unused_imports)]
+use tracing::{debug, error, info, span, trace, warn};
+
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(env_filter);
+    let registry = Registry::default().with(stderr_layer);
+    tracing::subscriber::set_global_default(registry)?;
+
+    info!("starting grandchild");
+
+    info!("doing stuff!");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    info!("grandchild done");
+    Ok(())
+}
