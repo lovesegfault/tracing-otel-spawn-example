@@ -1,19 +1,47 @@
-use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, EnvFilter, Layer, Registry};
+use std::{
+    fs::{create_dir_all, File},
+    sync::Arc,
+};
+
+use anyhow::Context;
+use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
+use opentelemetry_sdk::{
+    runtime,
+    trace::{BatchSpanProcessor, TracerProvider},
+};
+use opentelemetry_stdout::SpanExporterBuilder;
+
+use tokio::process::Command;
+
+use tracing_subscriber::{
+    filter::LevelFilter, layer::SubscriberExt, prelude::*, util::SubscriberInitExt, EnvFilter,
+    Layer, Registry,
+};
 
 #[allow(unused_imports)]
 use tracing::{debug, error, info, span, trace, warn};
 
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let run_id = std::env::var("RUN_ID").unwrap();
+    let self_id = uuid::Uuid::now_v7().to_string();
+    let tracer_provider = init_trace(&run_id, &self_id).expect("Failed to set up trace provider");
+    let tracer = tracer_provider.tracer("grandchild-tracer");
+
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(env_filter);
-    let registry = Registry::default().with(stderr_layer);
-    tracing::subscriber::set_global_default(registry)?;
+    Registry::default()
+        .with(stderr_layer)
+        .with(otel_layer)
+        .init();
+
+    let _span_guard =
+        tracing::info_span!("grandchild", run_id = %run_id, self_id = %self_id).entered();
 
     info!("starting grandchild");
 
@@ -21,5 +49,23 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     info!("grandchild done");
+
+    opentelemetry::global::shutdown_tracer_provider();
+
     Ok(())
+}
+
+fn init_trace(run_id: &String, self_id: &String) -> anyhow::Result<TracerProvider> {
+    let trace_logs_dir = format!("./logs/{run_id}");
+    create_dir_all(&trace_logs_dir).context("create log dir for trace")?;
+
+    let writer = File::create(format!("{}/grandchild-{}.json", &trace_logs_dir, self_id))
+        .context("create log file")?;
+    let exporter = SpanExporterBuilder::default()
+        .with_writer(Arc::new(writer))
+        .build();
+    let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
+    Ok(TracerProvider::builder()
+        .with_span_processor(processor)
+        .build())
 }

@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         }
     })?;
     let self_id = uuid::Uuid::now_v7().to_string();
-    let tracer_provider = init_trace(&run_id, &self_id).expect("Failed");
+    let tracer_provider = init_trace(&run_id, &self_id).expect("Failed to set up trace provider");
     let tracer = tracer_provider.tracer("parent-tracer");
 
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
