@@ -1,5 +1,6 @@
-use std::env::VarError;
 use std::fs::File;
+use std::sync::Arc;
+use std::{env::VarError, fs::create_dir_all};
 
 use anyhow::Context;
 use clap::Parser;
@@ -40,20 +41,25 @@ async fn main() -> anyhow::Result<()> {
             Ok(uuid)
         }
     })?;
-    let tracer_provider = init_trace(&run_id);
-    let tracer = tracer_provider.tracer("parent");
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let self_id = uuid::Uuid::now_v7().to_string();
+    let tracer_provider = init_trace(&run_id, &self_id).expect("Failed");
+    let tracer = tracer_provider.tracer("parent-tracer");
 
-    let env_filter = EnvFilter::builder()
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let stderr_env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(env_filter);
-    let registry = Registry::default().with(stderr_layer).with(otel_layer);
-    tracing::subscriber::set_global_default(registry)?;
+        .with_filter(stderr_env_filter);
+    // Sets registry as global default subscriber
+    Registry::default()
+        .with(stderr_layer)
+        .with(otel_layer)
+        .init();
 
     let args = Cli::parse();
+    let _span_guard = tracing::info_span!("parent", run_id = %run_id, self_id = %self_id).entered();
 
     info!(%run_id, "starting parent");
     let status = match args.command {
@@ -83,16 +89,22 @@ async fn main() -> anyhow::Result<()> {
 
     info!(command=?args.command, "parent done");
 
+    opentelemetry::global::shutdown_tracer_provider();
+
     Ok(())
 }
 
-fn init_trace(run_id: &String) -> TracerProvider {
-    let uuid = uuid::Uuid::now_v7();
-    let writer =
-        File::create(format!("{}/parent-{}.log", run_id, uuid)).expect("Failed to create log file");
-    let exporter = SpanExporterBuilder::default().with_writer(writer).build();
-    // let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
-    TracerProvider::builder()
-        .with_simple_exporter(exporter)
-        .build()
+fn init_trace(run_id: &String, self_id: &String) -> anyhow::Result<TracerProvider> {
+    let trace_logs_dir = format!("./logs/{run_id}");
+    create_dir_all(&trace_logs_dir).context("create log dir for trace")?;
+
+    let writer = File::create(format!("{}/parent-{}.json", &trace_logs_dir, self_id))
+        .context("create log file")?;
+    let exporter = SpanExporterBuilder::default()
+        .with_writer(Arc::new(writer))
+        .build();
+    let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
+    Ok(TracerProvider::builder()
+        .with_span_processor(processor)
+        .build())
 }
