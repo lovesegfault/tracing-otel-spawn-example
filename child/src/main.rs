@@ -1,10 +1,15 @@
 use std::{
+    cell::RefCell,
     fs::{create_dir_all, File},
+    rc::Rc,
     sync::Arc,
 };
 
 use anyhow::Context;
-use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
+use opentelemetry::{
+    global::ObjectSafeTracerProvider,
+    trace::{Span, Tracer, TracerProvider as _},
+};
 use opentelemetry_sdk::{
     runtime,
     trace::{BatchSpanProcessor, TracerProvider},
@@ -23,17 +28,24 @@ use tracing::{debug, error, info, span, trace, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let run_id = std::env::var("RUN_ID").ok();
+    let _run_id = std::env::var("RUN_ID").ok();
+    let run_id = _run_id.clone().unwrap_or("NULL".to_string());
     let self_id = uuid::Uuid::now_v7().to_string();
-    let otel_layer = if let Some(run_id) = &run_id {
+
+    // HACK:Use RC to keep TracerProvider from being dropped
+    // https://github.com/open-telemetry/opentelemetry-rust/issues/1625
+    let rc_tracer_provider: Rc<RefCell<Option<TracerProvider>>> = Rc::new(RefCell::new(None));
+    let otel_layer = if let Some(run_id) = &_run_id {
+        let mut ref_tracer_provider = rc_tracer_provider.borrow_mut();
         let tracer_provider =
             init_trace(run_id, &self_id).expect("Failed to set up trace provider");
+        *ref_tracer_provider = Some(tracer_provider);
+        let tracer_provider = ref_tracer_provider.as_ref().unwrap();
         let tracer = tracer_provider.tracer("grandchild-tracer");
 
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
         Some(otel_layer)
     } else {
-        error!("RUN_ID is not set");
         None
     };
     let env_filter = EnvFilter::builder()
@@ -48,8 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let _span_guard =
-        tracing::info_span!("child", run_id = %run_id.unwrap_or("NULL".to_string()), self_id = %self_id)
-            .entered();
+        tracing::info_span!("child", run_id = %&run_id, self_id = %&self_id).entered();
 
     info!("starting child");
 
