@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::fs::File;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::{env::VarError, fs::create_dir_all};
 
 use anyhow::Context;
 use clap::Parser;
+use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
 use opentelemetry_sdk::{
     runtime,
@@ -107,4 +110,44 @@ fn init_trace(run_id: &String, self_id: &String) -> anyhow::Result<TracerProvide
     Ok(TracerProvider::builder()
         .with_span_processor(processor)
         .build())
+}
+
+// Blatantly ripping off https://docs.rs/crate/opentelemetry-http/latest/source/src/lib.rs
+pub struct EnvInjector();
+
+impl Injector for EnvInjector {
+    fn set(&mut self, key: &str, value: String) {
+        std::env::set_var(key, value)
+    }
+}
+
+pub struct EnvExtractor(pub HashMap<String, String>);
+
+impl EnvExtractor {
+    pub fn new() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl Extractor for EnvExtractor {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(&String::from(key)).map(|s| s.as_str())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|value| value.deref()).collect::<Vec<_>>()
+    }
+}
+
+impl Default for EnvExtractor {
+    fn default() -> Self {
+        let mut map = HashMap::new();
+        for (key, val) in std::env::vars_os() {
+            // Use pattern bindings instead of testing .is_some() followed by .unwrap()
+            if let (Ok(k), Ok(v)) = (key.into_string(), val.into_string()) {
+                map.insert(k, v);
+            }
+        }
+        EnvExtractor(map)
+    }
 }
