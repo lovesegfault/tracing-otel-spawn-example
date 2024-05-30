@@ -29,13 +29,18 @@ use tracing::{debug, error, info, span, trace, warn};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _run_id = std::env::var("RUN_ID").ok();
-    let run_id = _run_id.clone().unwrap_or("NULL".to_string());
+    let run_id = _run_id.clone().unwrap_or_default();
+    let mut parent_id: String = String::new();
     let self_id = uuid::Uuid::now_v7().to_string();
 
     // HACK:Use RC to keep TracerProvider from being dropped
     // https://github.com/open-telemetry/opentelemetry-rust/issues/1625
     let rc_tracer_provider: Rc<RefCell<Option<TracerProvider>>> = Rc::new(RefCell::new(None));
     let otel_layer = if let Some(run_id) = &_run_id {
+        parent_id = std::env::var("PARENT_ID").expect("RUN_ID set but PARENT_ID is not");
+        // Set PARENT_ID for child
+        std::env::set_var("PARENT_ID", &self_id);
+
         let mut ref_tracer_provider = rc_tracer_provider.borrow_mut();
         let tracer_provider =
             init_trace(run_id, &self_id).expect("Failed to set up trace provider");
@@ -60,7 +65,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let _span_guard =
-        tracing::info_span!("child", run_id = %&run_id, self_id = %&self_id).entered();
+        tracing::info_span!("child", run_id = %run_id, self_id = %self_id, parent_id = %parent_id)
+            .entered();
 
     info!("starting child");
 

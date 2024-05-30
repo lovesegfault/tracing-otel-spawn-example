@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::ops::Deref;
+use std::os::unix::process::parent_id;
 use std::sync::Arc;
 use std::{env::VarError, fs::create_dir_all};
 
@@ -36,15 +37,36 @@ enum SubCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let run_id = std::env::var("RUN_ID").or_else(|err| match err {
-        VarError::NotUnicode(_) => anyhow::bail!("RUN_ID is not unicode"),
-        VarError::NotPresent => {
-            let uuid = uuid::Uuid::now_v7().to_string();
-            std::env::set_var("RUN_ID", &uuid);
-            Ok(uuid)
-        }
-    })?;
+    let run_id = std::env::var("RUN_ID");
+    let mut parent_id: String = String::new();
     let self_id = uuid::Uuid::now_v7().to_string();
+    let run_id: anyhow::Result<String> = match run_id {
+        Ok(run_id) => {
+            parent_id = std::env::var("PARENT_ID").expect("RUN_ID set but PARENT_ID is not");
+            Ok(run_id)
+        }
+        Err(e) => match e {
+            VarError::NotUnicode(_) => anyhow::bail!("RUN_ID is not unicode"),
+            VarError::NotPresent => {
+                let uuid = uuid::Uuid::now_v7().to_string();
+                std::env::set_var("RUN_ID", &uuid);
+                Ok(uuid)
+            }
+        },
+    };
+    let run_id = run_id?;
+
+    // Set PARENT_ID for child
+    std::env::set_var("PARENT_ID", &self_id);
+
+    // let run_id = std::env::var("RUN_ID").or_else(|err| match err {
+    //     VarError::NotUnicode(_) => anyhow::bail!("RUN_ID is not unicode"),
+    //     VarError::NotPresent => {
+    //         let uuid = uuid::Uuid::now_v7().to_string();
+    //         std::env::set_var("RUN_ID", &uuid);
+    //         Ok(uuid)
+    //     }
+    // })?;
     let tracer_provider = init_trace(&run_id, &self_id).expect("Failed to set up trace provider");
     let tracer = tracer_provider.tracer("parent-tracer");
 
@@ -62,9 +84,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Cli::parse();
-    let _span_guard = tracing::info_span!("parent", run_id = %run_id, self_id = %self_id).entered();
+    let _span_guard =
+        tracing::info_span!("parent", run_id = %run_id, self_id = %self_id, parent_id = %parent_id)
+            .entered();
 
-    info!(%run_id, "starting parent");
+    info!("starting parent");
     let status = match args.command {
         SubCommand::SpawnSelf => {
             info!("re-spawning parent");
