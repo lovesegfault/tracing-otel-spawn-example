@@ -6,15 +6,18 @@ use std::{
 };
 
 use anyhow::Context;
-use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
+use opentelemetry::trace::{
+    Span, SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, Tracer,
+    TracerProvider as _,
+};
 use opentelemetry_sdk::{
     runtime,
     trace::{BatchSpanProcessor, TracerProvider},
 };
 use opentelemetry_stdout::SpanExporterBuilder;
 
-use tokio::process::Command;
 
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, prelude::*, util::SubscriberInitExt, EnvFilter,
     Layer, Registry,
@@ -25,19 +28,13 @@ use tracing::{debug, error, info, span, trace, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _run_id = std::env::var("RUN_ID").ok();
-    let run_id = _run_id.clone().unwrap_or_default();
-    let mut parent_id: String = String::new();
     let self_id = uuid::Uuid::now_v7().to_string();
-    //
+    let run_id = std::env::var("RUN_ID").ok();
+
     // HACK:Use RC to keep TracerProvider from being dropped
     // https://github.com/open-telemetry/opentelemetry-rust/issues/1625
     let rc_tracer_provider: Rc<RefCell<Option<TracerProvider>>> = Rc::new(RefCell::new(None));
-    let otel_layer = if let Some(run_id) = &_run_id {
-        parent_id = std::env::var("PARENT_ID").expect("RUN_ID set but PARENT_ID is not");
-        // Set PARENT_ID for child
-        std::env::set_var("PARENT_ID", &self_id);
-
+    let otel_layer = if let Some(run_id) = &run_id {
         let mut ref_tracer_provider = rc_tracer_provider.borrow_mut();
         let tracer_provider =
             init_trace(run_id, &self_id).expect("Failed to set up trace provider");
@@ -61,8 +58,17 @@ async fn main() -> anyhow::Result<()> {
         .with(otel_layer)
         .init();
 
-    let _span_guard =
-        tracing::info_span!("grandchild", run_id = %run_id, self_id = %self_id, parent_id = %parent_id).entered();
+    let run_id = run_id.unwrap_or_default();
+    let _span = tracing::info_span!("grandchild", run_id = %run_id, self_id = %self_id);
+
+    if let Ok(Some(parent_context)) = get_env_context_for_parent() {
+        let pctx =
+            opentelemetry::Context::map_current(|cx| cx.with_remote_span_context(parent_context));
+
+        _span.set_parent(pctx);
+    }
+    set_env_context_for_child(_span.context().span().span_context());
+    let _span_guard = _span.entered();
 
     info!("starting grandchild");
 
@@ -89,4 +95,41 @@ fn init_trace(run_id: &String, self_id: &String) -> anyhow::Result<TracerProvide
     Ok(TracerProvider::builder()
         .with_span_processor(processor)
         .build())
+}
+
+fn set_env_context_for_child(span_ctx: &SpanContext) {
+    // https://www.w3.org/TR/trace-context-1/#traceparent-header
+    let version = "00"; // WARNING: This is hardcoded in the current spec but may change
+    let trace_id = span_ctx.trace_id();
+    // Sets parent_id for the child
+    let parent_id = span_ctx.span_id();
+    let trace_flags = span_ctx.trace_flags().to_u8();
+    let trace_parent = format!("{version}-{trace_id}-{parent_id}-{trace_flags}");
+    std::env::set_var("TRACEPARENT", trace_parent);
+    // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
+}
+
+fn get_env_context_for_parent() -> anyhow::Result<Option<SpanContext>> {
+    if let Ok(trace_parent) = std::env::var("TRACEPARENT") {
+        if let [version, trace_id, parent_id, trace_flags] =
+            trace_parent.split('-').collect::<Vec<_>>()[..]
+        {
+            // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
+            let parent_context = SpanContext::new(
+                TraceId::from_hex(trace_id).unwrap(),
+                SpanId::from_hex(parent_id).unwrap(),
+                TraceFlags::new(trace_flags.parse::<u8>().unwrap()),
+                true,
+                TraceState::default(),
+            );
+            println!("WE GOT EM BOYS");
+            Ok(Some(parent_context))
+        } else {
+            println!("Invalid TRACEPARENT format: {trace_parent}");
+            anyhow::bail!("Invalid TRACEPARENT format");
+        }
+    } else {
+        println!("No TRACEPARENT found");
+        Ok(None)
+    }
 }

@@ -1,20 +1,20 @@
-use std::collections::HashMap;
 use std::fs::File;
-use std::ops::Deref;
-use std::os::unix::process::parent_id;
 use std::sync::Arc;
 use std::{env::VarError, fs::create_dir_all};
 
 use anyhow::Context;
 use clap::Parser;
-use opentelemetry::propagation::{Extractor, Injector};
-use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
+use opentelemetry::trace::{
+    Span, SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, Tracer,
+    TracerProvider as _,
+};
 use opentelemetry_sdk::{
     runtime,
     trace::{BatchSpanProcessor, TracerProvider},
 };
 use opentelemetry_stdout::SpanExporterBuilder;
 use tokio::process::Command;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, prelude::*, util::SubscriberInitExt, EnvFilter,
     Layer, Registry,
@@ -37,36 +37,16 @@ enum SubCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let run_id = std::env::var("RUN_ID");
-    let mut parent_id: String = String::new();
     let self_id = uuid::Uuid::now_v7().to_string();
-    let run_id: anyhow::Result<String> = match run_id {
-        Ok(run_id) => {
-            parent_id = std::env::var("PARENT_ID").expect("RUN_ID set but PARENT_ID is not");
-            Ok(run_id)
+    let run_id = std::env::var("RUN_ID").or_else(|err| match err {
+        VarError::NotUnicode(_) => anyhow::bail!("RUN_ID is not unicode"),
+        VarError::NotPresent => {
+            let uuid = uuid::Uuid::now_v7().to_string();
+            std::env::set_var("RUN_ID", &uuid);
+            Ok(uuid)
         }
-        Err(e) => match e {
-            VarError::NotUnicode(_) => anyhow::bail!("RUN_ID is not unicode"),
-            VarError::NotPresent => {
-                let uuid = uuid::Uuid::now_v7().to_string();
-                std::env::set_var("RUN_ID", &uuid);
-                Ok(uuid)
-            }
-        },
-    };
-    let run_id = run_id?;
+    })?;
 
-    // Set PARENT_ID for child
-    std::env::set_var("PARENT_ID", &self_id);
-
-    // let run_id = std::env::var("RUN_ID").or_else(|err| match err {
-    //     VarError::NotUnicode(_) => anyhow::bail!("RUN_ID is not unicode"),
-    //     VarError::NotPresent => {
-    //         let uuid = uuid::Uuid::now_v7().to_string();
-    //         std::env::set_var("RUN_ID", &uuid);
-    //         Ok(uuid)
-    //     }
-    // })?;
     let tracer_provider = init_trace(&run_id, &self_id).expect("Failed to set up trace provider");
     let tracer = tracer_provider.tracer("parent-tracer");
 
@@ -84,9 +64,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Cli::parse();
-    let _span_guard =
-        tracing::info_span!("parent", run_id = %run_id, self_id = %self_id, parent_id = %parent_id)
-            .entered();
+    let _span = tracing::info_span!("parent", run_id = %run_id, self_id = %self_id);
+
+    if let Ok(Some(parent_context)) = get_env_context_for_parent() {
+        let pctx =
+            opentelemetry::Context::map_current(|cx| cx.with_remote_span_context(parent_context));
+
+        _span.set_parent(pctx);
+    }
+    set_env_context_for_child(_span.context().span().span_context());
+    let _span_guard = _span.entered();
 
     info!("starting parent");
     let status = match args.command {
@@ -136,42 +123,39 @@ fn init_trace(run_id: &String, self_id: &String) -> anyhow::Result<TracerProvide
         .build())
 }
 
-// Blatantly ripping off https://docs.rs/crate/opentelemetry-http/latest/source/src/lib.rs
-pub struct EnvInjector();
-
-impl Injector for EnvInjector {
-    fn set(&mut self, key: &str, value: String) {
-        std::env::set_var(key, value)
-    }
+fn set_env_context_for_child(span_ctx: &SpanContext) {
+    // https://www.w3.org/TR/trace-context-1/#traceparent-header
+    let version = "00"; // WARNING: This is hardcoded in the current spec but may change
+    let trace_id = span_ctx.trace_id();
+    // Sets parent_id for the child
+    let parent_id = span_ctx.span_id();
+    let trace_flags = span_ctx.trace_flags().to_u8();
+    let trace_parent = format!("{version}-{trace_id}-{parent_id}-{trace_flags}");
+    std::env::set_var("TRACEPARENT", trace_parent);
+    // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
 }
 
-pub struct EnvExtractor(pub HashMap<String, String>);
-
-impl EnvExtractor {
-    pub fn new() -> Self {
-        Self(Default::default())
-    }
-}
-
-impl Extractor for EnvExtractor {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(&String::from(key)).map(|s| s.as_str())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|value| value.deref()).collect::<Vec<_>>()
-    }
-}
-
-impl Default for EnvExtractor {
-    fn default() -> Self {
-        let mut map = HashMap::new();
-        for (key, val) in std::env::vars_os() {
-            // Use pattern bindings instead of testing .is_some() followed by .unwrap()
-            if let (Ok(k), Ok(v)) = (key.into_string(), val.into_string()) {
-                map.insert(k, v);
-            }
+fn get_env_context_for_parent() -> anyhow::Result<Option<SpanContext>> {
+    if let Ok(trace_parent) = std::env::var("TRACEPARENT") {
+        if let [version, trace_id, parent_id, trace_flags] =
+            trace_parent.split('-').collect::<Vec<_>>()[..]
+        {
+            // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
+            let parent_context = SpanContext::new(
+                TraceId::from_hex(trace_id).unwrap(),
+                SpanId::from_hex(parent_id).unwrap(),
+                TraceFlags::new(trace_flags.parse::<u8>().unwrap()),
+                true,
+                TraceState::default(),
+            );
+            println!("WE GOT EM BOYS");
+            Ok(Some(parent_context))
+        } else {
+            println!("Invalid TRACEPARENT format: {trace_parent}");
+            anyhow::bail!("Invalid TRACEPARENT format");
         }
-        EnvExtractor(map)
+    } else {
+        println!("No TRACEPARENT found");
+        Ok(None)
     }
 }
