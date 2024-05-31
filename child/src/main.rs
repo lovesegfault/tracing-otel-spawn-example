@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    fmt::Display,
     fs::{create_dir_all, File},
     rc::Rc,
     sync::Arc,
@@ -109,39 +110,99 @@ fn init_trace(run_id: &String, self_id: &String) -> anyhow::Result<TracerProvide
         .build())
 }
 
-fn set_env_context_for_child(span_ctx: &SpanContext) {
+struct TraceParent {
     // https://www.w3.org/TR/trace-context-1/#traceparent-header
-    let version = "00"; // WARNING: This is hardcoded in the current spec but may change
-    let trace_id = span_ctx.trace_id();
-    // Sets parent_id for the child
-    let parent_id = span_ctx.span_id();
-    let trace_flags = span_ctx.trace_flags().to_u8();
-    let trace_parent = format!("{version}-{trace_id}-{parent_id}-{trace_flags}");
-    std::env::set_var("TRACEPARENT", trace_parent);
+    version: String,
+    trace_id: TraceId,
+    parent_id: SpanId,
+    trace_flags: TraceFlags,
+}
+
+impl From<TraceParent> for SpanContext {
+    fn from(value: TraceParent) -> Self {
+        SpanContext::new(
+            value.trace_id,
+            value.parent_id,
+            value.trace_flags,
+            true,
+            TraceState::default(),
+        )
+    }
+}
+
+impl From<SpanContext> for TraceParent {
+    fn from(span_ctx: SpanContext) -> Self {
+        Self {
+            version: "00".to_string(), // WARNING: This is hardcoded in the current spec but may change
+            trace_id: span_ctx.trace_id(),
+            parent_id: span_ctx.span_id(),
+            trace_flags: span_ctx.trace_flags(),
+        }
+    }
+}
+
+impl From<&SpanContext> for TraceParent {
+    fn from(span_ctx: &SpanContext) -> Self {
+        Self {
+            version: "00".to_string(), // WARNING: This is hardcoded in the current spec but may change
+            trace_id: span_ctx.trace_id(),
+            parent_id: span_ctx.span_id(),
+            trace_flags: span_ctx.trace_flags(),
+        }
+    }
+}
+
+impl TryFrom<&String> for TraceParent {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &String) -> Result<Self, Self::Error> {
+        if let [version, trace_id, parent_id, trace_flags] =
+            value.split('-').collect::<Vec<_>>()[..]
+        {
+            // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
+            let trace_parent = TraceParent {
+                version: version.to_string(),
+                trace_id: TraceId::from_hex(trace_id).unwrap(),
+                parent_id: SpanId::from_hex(parent_id).unwrap(),
+                trace_flags: TraceFlags::new(trace_flags.parse::<u8>().unwrap()),
+            };
+            Ok(trace_parent)
+        } else {
+            anyhow::bail!("Invalid TRACEPARENT format");
+        }
+    }
+}
+
+impl Display for TraceParent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{version}-{trace_id}-{parent_id}-{trace_flags}",
+            version = self.version,
+            trace_id = self.trace_id,
+            parent_id = self.parent_id,
+            trace_flags = self.trace_flags.to_u8()
+        )
+    }
+}
+
+fn set_env_context_for_child(span_ctx: &SpanContext) {
+    let trace_parent = TraceParent::from(span_ctx);
+    std::env::set_var("TRACEPARENT", trace_parent.to_string());
     // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
 }
 
 fn get_env_context_for_parent() -> anyhow::Result<Option<SpanContext>> {
-    if let Ok(trace_parent) = std::env::var("TRACEPARENT") {
-        if let [version, trace_id, parent_id, trace_flags] =
-            trace_parent.split('-').collect::<Vec<_>>()[..]
-        {
-            // TODO: TRACESTATE https://www.w3.org/TR/trace-context-1/#tracestate-header
-            let parent_context = SpanContext::new(
-                TraceId::from_hex(trace_id).unwrap(),
-                SpanId::from_hex(parent_id).unwrap(),
-                TraceFlags::new(trace_flags.parse::<u8>().unwrap()),
-                true,
-                TraceState::default(),
-            );
-            println!("WE GOT EM BOYS");
-            Ok(Some(parent_context))
+    if let Ok(trace_parent_env_var) = std::env::var("TRACEPARENT") {
+        if let Ok(trace_parent) = TraceParent::try_from(&trace_parent_env_var) {
+            info!("TRACEPARENT: {trace_parent}");
+            Ok(Some(trace_parent.into()))
         } else {
-            println!("Invalid TRACEPARENT format: {trace_parent}");
+            error!("Invalid TRACEPARENT: {trace_parent_env_var}");
             anyhow::bail!("Invalid TRACEPARENT format");
         }
     } else {
-        println!("No TRACEPARENT found");
+        info!("No TRACEPARENT found");
         Ok(None)
     }
 }
