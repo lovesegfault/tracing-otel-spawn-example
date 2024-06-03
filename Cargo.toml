@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["parent", "child", "grandchild"]
+members = ["parent", "child", "grandchild", "writer-demo"]
 
 [workspace.package]
 edition = "2021"
