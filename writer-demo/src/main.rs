@@ -53,9 +53,7 @@ struct FoobarFakeEmf {
     telemetry: Vec<serde_json::Value>,
 }
 
-struct MetricsGuard {
-
-}
+struct MetricsGuard {}
 
 impl Drop for MetricsGuard {
     fn drop(&mut self) {
@@ -65,12 +63,7 @@ impl Drop for MetricsGuard {
 }
 
 fn main() -> anyhow::Result<()> {
-    let log_files = &[
-        "logs/018fdf43-7c5f-7bc9-9969-82646838d255/child-018fdf43-7c7c-7323-a403-16aa9f1fd2cc.json",
-        "logs/018fdf43-7c5f-7bc9-9969-82646838d255/grandchild-018fdf43-7e82-7e72-9afa-3e6fd52b8edf.json",
-        "logs/018fdf43-7c5f-7bc9-9969-82646838d255/parent-018fdf43-7c5f-785c-898a-0db99cec4f6d.json",
-        "logs/018fdf43-7c5f-7bc9-9969-82646838d255/parent-018fdf43-7c6f-7523-a89b-b82be5de4482.json",
-    ];
+    let log_files = &["logs/test.jsonl"];
 
     let mut combined_fake_emf = FakeEmfJson {
         foobar_name: "cargo-foobar".into(),
@@ -82,22 +75,26 @@ fn main() -> anyhow::Result<()> {
 
     for log in log_files {
         // ResourceSpan
-        let json: serde_json::Value = serde_json::de::from_reader(File::open(&log)?)?;
-        let resource_spans = json
-            .as_object()
-            .context("json not an obj")?
-            .get("resourceSpans")
-            .context("no resourceSpans in json")?
-            .as_array()
-            .context("resourceSpans is not an array")?;
-        combined_fake_emf
-            ._foobar
-            .telemetry
-            .extend_from_slice(&resource_spans);
+        let json_lines = serde_json::Deserializer::from_reader(File::open(&log)?)
+            .into_iter::<serde_json::Value>();
+        let mut out = File::create("combined-fake-emf.jsonl")?;
+        for line in json_lines {
+            let json = line?;
+            let resource_spans = json
+                .as_object()
+                .context("json not an obj")?
+                .get("resourceSpans")
+                .context("no resourceSpans in json")?
+                .as_array()
+                .context("resourceSpans is not an array")?;
+            combined_fake_emf
+                ._foobar
+                .telemetry
+                .extend_from_slice(&resource_spans);
+            serde_json::ser::to_writer(&mut out, &combined_fake_emf)?;
+            out.write_all(b"\n")?;
+        }
     }
-
-    let mut out = File::create("combined-fake-emf.json")?;
-    serde_json::ser::to_writer_pretty(&mut out, &combined_fake_emf)?;
 
     Ok(())
 }
