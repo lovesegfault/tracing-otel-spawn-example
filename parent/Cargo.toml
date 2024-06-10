@@ -7,6 +7,11 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-stdout.workspace = true
 tokio.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
+uuid.workspace = true
